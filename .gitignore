@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# SQLite DB
+*.sqlite
+*.db
+
+# Secrets & env
+.env
+
+# Mac OS
+.DS_Store
+
+# Output files
+summary/*.docx
