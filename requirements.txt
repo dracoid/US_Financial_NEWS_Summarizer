@@ -1,8 +1,15 @@
 pandas
-transformers
+openpyxl                    # ← Excel 읽기 필수
+transformers==4.41.2
+torch==2.2.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu     # cpu wheel만
+numpy<2                     # ★ 핵심: NumPy 1.x 고정
 newspaper3k
+lxml
+lxml_html_clean
 python-docx
-torch
-lxml[html_clean]
 python-dotenv
 python-telegram-bot==20.7
+sentencepiece
+scipy
+tqdm

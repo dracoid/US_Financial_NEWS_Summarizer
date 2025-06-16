@@ -1,77 +1,94 @@
+import os
 import time
 import pandas as pd
+import warnings
 from newspaper import Article, Config
 from transformers import pipeline
-from .config import EXCEL_PATH
-from .db import get_connection
+from app.db import insert_summary, summary_exists
+from app.telegram_sender import send_docx_files
+from app.config import EXCEL_PATH, DOCX_SAVE_DIR
+from docx import Document
+from datetime import datetime
 
-# HuggingFace 요약 모델
-summarizer_model = pipeline("summarization", model="facebook/bart-large-cnn")
+# NumPy 경고 무시 (PyTorch 내부에서 발생하는 NumPy 관련 경고 억제)
+warnings.filterwarnings("ignore", message="Failed to initialize NumPy")
 
-# User-Agent 설정 (403 차단 회피)
-user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'
-newspaper_config = Config()
-newspaper_config.browser_user_agent = user_agent
-newspaper_config.request_timeout = 10
+# 사용자 User-Agent 설정 (크롤링 차단 회피용)
+user_config = Config()
+user_config.browser_user_agent = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+
+# Hugging Face summarizer 로딩
+print("Device set to use cpu")
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0)
 
 def summarize_and_store():
+    print("🛠 DB 초기화...")
+
+    # Excel 파일 로드
     df = pd.read_excel(EXCEL_PATH)
-    conn = get_connection()
-    cursor = conn.cursor()
+    df = df.sort_values(by="published_dt")
 
-    # 먼저 이미 저장된 링크 목록 불러오기 → set으로 빠른 조회
-    cursor.execute("SELECT link FROM news_summaries")
-    processed_links = set(row[0] for row in cursor.fetchall())
+    print("📰 뉴스 요약 시작...")
 
-    tickers = df['ticker'].unique()
+    # 티커별 그룹핑
+    grouped = df.groupby("ticker")
 
-    for ticker in tickers:
-        df_t = df[df['ticker'] == ticker].sort_values(by='published_dt')
+    for ticker, group in grouped:
+        doc = Document()
+        doc.add_heading(f"News Summary for {ticker}", 0)
+        saved = False
 
-        for _, row in df_t.iterrows():
-            link = row['link']
-            title = row['title']
-            date = row['published_dt']
+        for _, row in group.iterrows():
+            title = row["title"]
+            link = row["link"]
+            date = row["published_dt"]
 
-            # ✅ 이미 저장된 기사 스킵
-            if link in processed_links:
+            # 중복 여부 확인
+            if summary_exists(title):
                 print(f"[SKIP] 이미 저장됨: {title}")
                 continue
 
             try:
-                # 기사 크롤링
-                article = Article(link, config=newspaper_config)
+                article = Article(link, config=user_config)
                 article.download()
                 article.parse()
-                text = article.text.strip()
+                text = article.text
 
+                # 너무 짧은 기사 제외
                 if len(text) < 200:
-                    raise ValueError("본문이 너무 짧음")
+                    print(f"[SKIP] 기사 너무 짧음: {title}")
+                    continue
 
-                # 요약
-                input_text = text[:1024]
-                max_len = min(130, len(input_text) // 2)
+                # 요약 수행
+                summary = summarizer(text[:1024], max_length=130, min_length=30, do_sample=False)[0]['summary_text']
 
-                summary = summarizer_model(
-                    input_text,
-                    max_length=max_len,
-                    min_length=30,
-                    do_sample=False
-                )[0]['summary_text']
+                # DB 저장
+                insert_summary(title, date, summary, link)
+
+                # DOCX 저장 준비
+                doc.add_heading(str(date), level=2)
+                doc.add_paragraph(f"🔗 {link}")
+                doc.add_paragraph(f"📰 {title}")
+                doc.add_paragraph(summary)
+                doc.add_paragraph("-" * 30)
+                print(f"[✓] {ticker}: {title}")
+                saved = True
+                time.sleep(1)
 
             except Exception as e:
+                insert_summary(title, date, f"(크롤링 실패: {e})", link)
                 print(f"[Error] {link}: {e}")
-                summary = "크롤링 금지로 요약 불가"
+                continue
 
-            # 저장 (성공/실패 불문)
-            cursor.execute("""
-                INSERT INTO news_summaries (ticker, title, published_dt, link, summary)
-                VALUES (?, ?, ?, ?, ?)
-            """, (ticker, title, date, link, summary))
-            conn.commit()
-            processed_links.add(link)  # 즉시 추가하여 중복 방지
+        # DOCX 저장
+        if saved:
+            filename = os.path.join(DOCX_SAVE_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx")
+            doc.save(filename)
+            print(f"[📄 저장 완료] {filename}")
 
-            print(f"[✓] {ticker}: {title}")
-            time.sleep(1)
+    # 텔레그램 전송
+    send_docx_files()
 
-    conn.close()
